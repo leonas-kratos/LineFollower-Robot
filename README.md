@@ -2,10 +2,29 @@
 
 ## PCB Visualize
 
+### Top Down PCB
+
 <table>
   <tr>
     <td><img src="Images/top_pcb.png" width="400"/></td>
     <td><img src="Images/bot_pcb.png" width="400"/></td>
+  </tr>
+</table>
+
+### Top Down Layer
+
+<table>
+  <tr>
+    <td><img src="Images/top_layer.png" width="400"/></td>
+    <td><img src="Images/bot_layer.png" width="400"/></td>
+  </tr>
+</table>
+
+### WireFrame
+
+<table>
+  <tr>
+    <td><img src="Images/WireFrame.png" width="400"/></td>
   </tr>
 </table>
 
