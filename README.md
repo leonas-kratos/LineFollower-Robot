@@ -59,8 +59,6 @@ Each encoder has two channels: A and B.
 |:-----------:|:---------:|-------------|
 | A (CH1) | PA0 `TIM2_CH1` | Channel A |
 | B (CH2) | PA1 `TIM2_CH2` | Channel B |
-| VCC | 3.3V or 5V | |
-| GND | GND | |
 
 ### Right Encoder — TIM4
 
@@ -68,8 +66,6 @@ Each encoder has two channels: A and B.
 |:-----------:|:---------:|-------------|
 | A (CH1) | PB6 `TIM4_CH1` | Channel A |
 | B (CH2) | PB7 `TIM4_CH2` | Channel B |
-| VCC | 3.3V or 5V | |
-| GND | GND | |
 ---
 
 ## 4. HC-05 — Bluetooth UART
