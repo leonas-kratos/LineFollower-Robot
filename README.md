@@ -13,8 +13,8 @@
 
 > **MCU:** STM32F401RE Nucleo-64 <br>
 > **Driver:** TB6612FNG <br>
-> **Line Sensor:** TCRT5000 × 5 (ADC analog) <br>
-> **Encoder:** GA12-N20 <br>
+> **Line Sensor:** TCRT5000 × 5<br>
+> **Encoder:** GA12-N20 x 2<br>
 > **Bluetooth:** HC-05 <br>
 
 ---
