@@ -1,5 +1,14 @@
 # Line Follower Robot
 
+## PCB Visualize
+
+<table>
+  <tr>
+    <td><img src="Images/top_pcb.png" width="400"/></td>
+    <td><img src="Images/bot_pcb.png" width="400"/></td>
+  </tr>
+</table>
+
 ## Pin Mapping
 
 > **MCU:** STM32F401RE Nucleo-64 <br>
