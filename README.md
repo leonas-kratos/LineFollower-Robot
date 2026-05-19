@@ -44,7 +44,7 @@
 |:----------:|:---------:|-------------|
 | PWMA | PB0 `TIM3_CH3` | PWM Motor A — **Left** wheel |
 | AIN1 | PB13 `GPIO OUT` | Motor A direction |
-| AIN2 | PC14 `GPIO OUT` | Motor A direction |
+| AIN2 | PB4 `GPIO OUT` | Motor A direction |
 | PWMB | PA7 `TIM3_CH2` | PWM Motor B — **Right** wheel |
 | BIN1 | PB15 `GPIO OUT` | Motor B direction |
 | BIN2 | PB10 `GPIO OUT` | Motor B direction |
