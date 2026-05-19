@@ -45,6 +45,31 @@
  *   PA5 = LD2
  *
  * ============================================================
+ * ENCODER STRAIGHT CORRECTION
+ * ============================================================
+ *   GA12 N20: 11 PPR truoc hop so (quadrature x4 = 44 counts/vong truc motor)
+ *   Chi kich hoat khi |g_error| < ENC_STRAIGHT_ERROR_THRESHOLD (xe di gan thang)
+ *   So sanh toc do 2 banh (delta counts / chu ky), bu PWM de 2 banh bang nhau
+ *   He so KP_ENC chinh qua lenh BT: "E0.3" (vi du)
+ *
+ * ============================================================
+ * QUAY 90 DO
+ * ============================================================
+ *   Phuong phap: quay tai cho (1 banh tien, 1 banh lui) + dem xung encoder
+ *                + xac nhan bang cam bien IR khi thay line
+ *
+ *   Ket thuc quay khi THOA MAN CA HAI dieu kien:
+ *     1) Xung encoder >= TURN_90_COUNTS (uoc tinh theo wheelbase)
+ *     2) Cam bien C (trung tam) hoac (L1 va R1) phat hien line
+ *
+ *   TURN_90_COUNTS:
+ *     = (pi * WHEELBASE_MM) / (4 * WHEEL_CIRCUMFERENCE_MM) * COUNTS_PER_REV
+ *     Chinh qua lenh BT: "C120" (vi du: 120 counts)
+ *     Mac dinh: 100 counts (chinh lai sau khi do wheelbase thuc te)
+ *
+ *   Sau khi quay xong: reset PID, Ramp_Reset(), tiep tuc bam line
+ *
+ * ============================================================
  * LENH BT RUNTIME (TUNING MODE - gui 'T' de vao):
  *   P2.5   -> Kp = 2.5
  *   I0.01  -> Ki = 0.01
@@ -54,13 +79,15 @@
  *   V40    -> MANUAL_SPEED = 40
  *   X250   -> MANUAL_TIMEOUT_MS = 250
  *   H500   -> ADC threshold
- *   Z3     -> RAMP_STEP (tang toc moi chu ky 10ms)
- *   N15    -> RAMP_MIN_START (toc do khoi dong)
- *   W1<v>  -> Trong so sensor L2  (vi du: W18.0)
- *   W2<v>  -> Trong so sensor L1  (vi du: W21.5)
- *   W3<v>  -> Trong so sensor C   (vi du: W30.0)
- *   W4<v>  -> Trong so sensor R1  (vi du: W4-1.5)
- *   W5<v>  -> Trong so sensor R2  (vi du: W5-8.0)
+ *   Z3     -> RAMP_STEP
+ *   N15    -> RAMP_MIN_START
+ *   E0.3   -> KP_ENC (he so chinh thang encoder)
+ *   C120   -> TURN_90_COUNTS (xung de quay 90 do)
+ *   W1<v>  -> Trong so sensor L2
+ *   W2<v>  -> Trong so sensor L1
+ *   W3<v>  -> Trong so sensor C
+ *   W4<v>  -> Trong so sensor R1
+ *   W5<v>  -> Trong so sensor R2
  *   R      -> Reset tat ca ve mac dinh
  *   Q      -> Thoat Tuning, tiep tuc chay
  *
@@ -71,6 +98,7 @@
  *   S  -> STOP
  *   T  -> Vao Tuning mode
  *   I/K/J/L -> Tien/Lui/Trai/Phai (MANUAL mode)
+ *   J/L     -> Quay 90 do trai/phai (AUTO mode dang chay)
  ******************************************************************************
  */
 /* USER CODE END Header */
@@ -105,20 +133,79 @@ DMA_HandleTypeDef  hdma_adc1;
 #define DEFAULT_ADC_THRESHOLD   1000
 
 /* Soft start mac dinh */
-#define DEFAULT_RAMP_STEP         2      /* Tang toc do moi chu ky PID 10ms  */
-#define DEFAULT_RAMP_MIN_START   15      /* Toc do khoi dong ban dau (%)      */
+#define DEFAULT_RAMP_STEP         2
+#define DEFAULT_RAMP_MIN_START   15
 
-/* Trong so sensor mac dinh: Trai duong, Phai am, Trung tam = 0 */
+/* Trong so sensor mac dinh */
 #define DEFAULT_W0   -12.0f    /* L2  */
-#define DEFAULT_W1    1.5f    /* L1  */
+#define DEFAULT_W1    1.5f     /* L1  */
 #define DEFAULT_W2    0.0f     /* C   */
-#define DEFAULT_W3   -1.5f    /* R1  */
+#define DEFAULT_W3   -1.5f     /* R1  */
 #define DEFAULT_W4    12.0f    /* R2  */
 
 /* =========================================================================
+ * Encoder Straight Correction
+ *
+ *   KP_ENC : he so P cho vong kin toc do 2 banh.
+ *            Tang -> chinh thang nhanh hon nhung co the dao dong.
+ *            Nen bat dau voi 0.1~0.3, chinh qua lenh 'E'.
+ *
+ *   ENC_STRAIGHT_ERROR_THRESHOLD : nguong |error| de xet xe dang di thang.
+ *            Neu error PID vuot nguong nay (dang vao cua), tat correction
+ *            de khong xung dot voi PID line.
+ * =========================================================================*/
+#define DEFAULT_KP_ENC                  0.2f
+#define ENC_STRAIGHT_ERROR_THRESHOLD    1.0f   /* |error| < 1.0 thi moi chinh thang */
+
+static float g_kp_enc = DEFAULT_KP_ENC;
+
+/* Luu xung encoder cuoi chu ky de tinh delta */
+static int32_t g_enc_left_prev  = 0;
+static int32_t g_enc_right_prev = 0;
+
+/* =========================================================================
+ * Quay 90 do
+ *
+ *   TURN_90_COUNTS : so xung encoder can de quay 90 do.
+ *     Cong thuc tinh (can do wheelbase thuc te):
+ *       counts = (PI * wheelbase_mm / 4 / wheel_circumference_mm) * counts_per_rev
+ *     Counts per rev = 11 PPR * 4 (quadrature) * gear_ratio
+ *     Vi du: gear ratio 30:1, banh D=34mm, wheelbase=100mm
+ *       counts_per_rev_wheel = 44 * 30 = 1320
+ *       circumference = PI * 34 = 106.8 mm
+ *       counts = (PI * 100 / 4 / 106.8) * 1320 = ~970  (qua lon -> do lai)
+ *     => Gia tri thuc te phu thuoc wheelbase, do bang thuc nghiem la chinh xac nhat.
+ *     => Mac dinh 100, chinh qua lenh 'C' trong Tuning.
+ *
+ *   TURN_SPEED : toc do quay tai cho (%).
+ *
+ *   TURN_IR_CONFIRM : so cam bien IR can phat hien line de xac nhan ket thuc quay.
+ *     = 1 : chi can C hoac bat ky 1 cam bien.
+ *     >= 2: can nhieu cam bien hon (chinh xac hon, it bi false positive).
+ *
+ *   TURN_TIMEOUT_MS : thoi gian toi da quay, tranh treo sau neu cam bien khong gap line.
+ * =========================================================================*/
+#define DEFAULT_TURN_90_COUNTS   100     /* chinh lai sau khi do wheelbase */
+#define TURN_SPEED               40      /* % PWM khi quay tai cho         */
+#define TURN_IR_CONFIRM          1       /* so cam bien can confirm         */
+#define TURN_TIMEOUT_MS          2000    /* timeout quay toi da (ms)        */
+
+static uint16_t g_turn_90_counts = DEFAULT_TURN_90_COUNTS;
+
+/* Trang thai quay */
+typedef enum {
+    TURN_IDLE  = 0,
+    TURN_LEFT  = 1,
+    TURN_RIGHT = 2
+} TurnState_t;
+
+static volatile TurnState_t g_turn_state      = TURN_IDLE;
+static          int32_t     g_turn_enc_start_L = 0;
+static          int32_t     g_turn_enc_start_R = 0;
+static          uint32_t    g_turn_start_tick  = 0;
+
+/* =========================================================================
  * Chieu quay motor
- *   +1 = chieu binh thuong
- *   -1 = dao nguoc
  * =========================================================================*/
 #define MOTOR_A_DIR   (+1)
 #define MOTOR_B_DIR   (+1)
@@ -148,10 +235,6 @@ static uint32_t g_last_pid_time = 0;
 
 /* =========================================================================
  * Soft Start / Ramp
- *   g_ramp_speed : toc do hien tai dang duoc ap dung (tang dan -> g_base_speed)
- *   g_ramping    : 1 = dang trong giai doan tang toc, 0 = da dat toc do muc tieu
- *   g_ramp_step  : muc tang moi chu ky PID 10ms (chinh qua lenh Z)
- *   g_ramp_min   : toc do khoi dong (chinh qua lenh N)
  * =========================================================================*/
 static uint8_t  g_ramp_speed = 0;
 static uint8_t  g_ramping    = 0;
@@ -167,10 +250,21 @@ static volatile uint16_t g_adc_raw[SENSOR_COUNT];
 static uint8_t g_L2, g_L1, g_C, g_R1, g_R2;
 
 /* =========================================================================
- * Encoder
+ * Encoder - doc counter TIM2/TIM4
+ *   Dung gia tri raw 16-bit signed de xu ly overflow tu dong
  * =========================================================================*/
 static int32_t g_enc_left  = 0;
 static int32_t g_enc_right = 0;
+
+/* Ham doc encoder: ep kieu int16_t de xu ly overflow 16-bit dung */
+static inline int32_t Enc_ReadLeft(void)
+{
+    return (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(&htim2);
+}
+static inline int32_t Enc_ReadRight(void)
+{
+    return (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(&htim4);
+}
 
 /* =========================================================================
  * Hang so khac
@@ -233,6 +327,10 @@ void LineFollow_PID(void);
 void Ramp_Reset(void);
 void Ramp_Update_Manual(void);
 
+void Turn90_Start(TurnState_t dir);
+void Turn90_Update(void);
+uint8_t Turn90_CheckIR(void);
+
 void UART_PrintStatus(void);
 void BT_Send(const char *str);
 void BT_SendStatus(void);
@@ -272,7 +370,7 @@ void TB6612_Disable(void) { HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET)
 /* =========================================================================
  * Motor A (Trai) - PWMA = TIM3_CH3 (PB0)
  *   AIN1=PC13  AIN2=PB3
- *   Tien: AIN1=0 AIN2=1  Lui: AIN1=1 AIN2=0  Brake: AIN1=1 AIN2=1
+ *   Tien: AIN1=1 AIN2=0  Lui: AIN1=0 AIN2=1  Brake: AIN1=1 AIN2=1
  * =========================================================================*/
 void MotorA_SetSpeed(int speed)
 {
@@ -299,7 +397,7 @@ void MotorA_SetSpeed(int speed)
 /* =========================================================================
  * Motor B (Phai) - PWMB = TIM3_CH2 (PA7)
  *   BIN1=PB15  BIN2=PB10
- *   Tien: BIN1=0 BIN2=1  Lui: BIN1=1 BIN2=0  Brake: BIN1=1 BIN2=1
+ *   Tien: BIN1=1 BIN2=0  Lui: BIN1=0 BIN2=1  Brake: BIN1=1 BIN2=1
  * =========================================================================*/
 void MotorB_SetSpeed(int speed)
 {
@@ -343,7 +441,6 @@ void Motors_Brake(void)
 
 /* =========================================================================
  * ADC_ReadSensors
- *   DMA cap nhat g_adc_raw[] lien tuc -> ham nay chi phan tich nguong.
  * =========================================================================*/
 void ADC_ReadSensors(void)
 {
@@ -356,15 +453,6 @@ void ADC_ReadSensors(void)
 
 /* =========================================================================
  * Soft Start helpers
- *
- * Ramp_Reset():
- *   Goi moi khi bat dau chay (G, nut bam, ExitTuning).
- *   Dat g_ramp_speed = g_ramp_min va bat co g_ramping.
- *   PID se tang dan g_ramp_speed len g_base_speed moi chu ky 10ms.
- *
- * Ramp_Update_Manual():
- *   Goi moi chu ky 10ms khi MANUAL mode dang ramping.
- *   Sau khi dat toc do muc tieu thi g_ramping = 0.
  * =========================================================================*/
 void Ramp_Reset(void)
 {
@@ -389,17 +477,140 @@ void Ramp_Update_Manual(void)
         g_ramping    = 0;
     }
 
-    /* Cap nhat toc do motor theo chieu dang chay */
     if (g_spd_A > 0 && g_spd_B > 0) {
-        /* Tien */
         MotorA_SetSpeed((int)g_ramp_speed);
         MotorB_SetSpeed((int)g_ramp_speed);
     } else if (g_spd_A < 0 && g_spd_B < 0) {
-        /* Lui */
         MotorA_SetSpeed(-(int)g_ramp_speed);
         MotorB_SetSpeed(-(int)g_ramp_speed);
     }
-    /* Truong hop quay tai cho (J/L): khong ramp, toc do full ngay */
+}
+
+/* =========================================================================
+ * QUAY 90 DO
+ * =========================================================================
+ *
+ * Turn90_Start(dir):
+ *   - Luu vi tri encoder hien tai lam moc (start_L, start_R)
+ *   - Ghi nhan thoi diem bat dau (timeout)
+ *   - Dat toc do quay tai cho: 1 banh tien, 1 banh lui
+ *   - Dat g_turn_state
+ *
+ * Turn90_CheckIR():
+ *   Tra ve 1 neu cam bien IR xac nhan da thay line moi.
+ *   Dieu kien: cam bien C bat HOAC tong so cam bien bat >= TURN_IR_CONFIRM.
+ *   (Tat sensor bien L2/R2 de tranh nhan dang line cu khi moi bat dau quay)
+ *
+ * Turn90_Update() - goi moi 10ms:
+ *   1. Tinh tong xung da quay (trung binh 2 banh de chinh xac hon)
+ *   2. Kiem tra timeout
+ *   3. Neu du xung VA IR confirm -> ket thuc quay:
+ *        brake ngan, reset PID, Ramp_Reset(), tiep tuc bam line
+ *   4. Neu du xung nhung IR chua confirm -> tiep tuc quay them mot chut
+ *      (cho den khi IR confirm hoac timeout)
+ *
+ * Luu y:
+ *   - Trong khi g_turn_state != TURN_IDLE, LineFollow_PID() bi bo qua.
+ *   - Nen chinh TURN_90_COUNTS bang thuc nghiem:
+ *       Tang neu qua 90 do, giam neu chua du.
+ * =========================================================================*/
+
+uint8_t Turn90_CheckIR(void)
+{
+    /* Dem so cam bien dang phat hien line (bo qua L2, R2 de tranh false positive) */
+    uint8_t cnt = (uint8_t)(g_L1 + g_C + g_R1);
+
+    /* C bat: chac chan da thay line thang */
+    if (g_C) return 1;
+
+    /* Hoac du so cam bien xac nhan */
+    if (cnt >= TURN_IR_CONFIRM) return 1;
+
+    return 0;
+}
+
+void Turn90_Start(TurnState_t dir)
+{
+    if (g_turn_state != TURN_IDLE) return;   /* Tranh goi chong cheo */
+
+        /* Luu moc encoder */
+        g_turn_enc_start_L = Enc_ReadLeft();
+    g_turn_enc_start_R = Enc_ReadRight();
+    g_turn_start_tick  = HAL_GetTick();
+    g_turn_state       = dir;
+
+    /* Dung xe ngan truoc khi quay (tranh truot) */
+    Motors_Brake();
+    HAL_Delay(50);
+
+    if (dir == TURN_LEFT) {
+        /* Quay trai: banh phai tien, banh trai lui */
+        MotorA_SetSpeed(-TURN_SPEED);
+        MotorB_SetSpeed( TURN_SPEED);
+        strncpy(g_state, "TURN_LEFT_90   ", sizeof(g_state));
+        printf("\r\n=== TURN 90 LEFT START (target=%d counts) ===\r\n", g_turn_90_counts);
+        BT_Send("$TURN,LEFT_90_START\r\n");
+    } else {
+        /* Quay phai: banh trai tien, banh phai lui */
+        MotorA_SetSpeed( TURN_SPEED);
+        MotorB_SetSpeed(-TURN_SPEED);
+        strncpy(g_state, "TURN_RIGHT_90  ", sizeof(g_state));
+        printf("\r\n=== TURN 90 RIGHT START (target=%d counts) ===\r\n", g_turn_90_counts);
+        BT_Send("$TURN,RIGHT_90_START\r\n");
+    }
+}
+
+void Turn90_Update(void)
+{
+    if (g_turn_state == TURN_IDLE) return;
+
+    ADC_ReadSensors();
+
+    /* Tinh xung da quay (dung gia tri tuyet doi, trung binh 2 banh) */
+    int32_t dL = abs(Enc_ReadLeft()  - g_turn_enc_start_L);
+    int32_t dR = abs(Enc_ReadRight() - g_turn_enc_start_R);
+    int32_t enc_traveled = (dL + dR) / 2;
+
+    uint8_t enc_done = (enc_traveled >= (int32_t)g_turn_90_counts);
+    uint8_t ir_done  = Turn90_CheckIR();
+    uint8_t timeout  = ((HAL_GetTick() - g_turn_start_tick) >= TURN_TIMEOUT_MS);
+
+    /*
+     * Ket thuc quay khi:
+     *   (a) Du xung VA IR confirm  -> chinh xac nhat
+     *   (b) Timeout                -> an toan, tranh treo
+     *
+     * Neu du xung nhung chua co IR: tiep tuc quay them (cho IR).
+     * Truong hop nay thuong xay ra khi TURN_90_COUNTS qua nho.
+     */
+    if ((enc_done && ir_done) || timeout)
+    {
+        char buf[60];
+        snprintf(buf, sizeof(buf),
+                 "$TURN,%s_90_END,enc=%ld,ir=%d,to=%d\r\n",
+                 (g_turn_state == TURN_LEFT) ? "LEFT" : "RIGHT",
+                 (long)enc_traveled, ir_done, timeout);
+        BT_Send(buf);
+        printf("=== TURN 90 END: enc=%ld ir=%d timeout=%d ===\r\n",
+               (long)enc_traveled, ir_done, timeout);
+
+        /* Dung xe ngan */
+        Motors_Brake();
+        HAL_Delay(30);
+
+        /* Reset trang thai quay */
+        g_turn_state = TURN_IDLE;
+
+        /* Reset PID va bat dau lai voi soft start */
+        g_integral      = 0.0f;
+        g_last_error    = 0.0f;
+        g_last_pid_time = HAL_GetTick();
+        Ramp_Reset();
+
+        strncpy(g_state, "RAMP_AFTER_TURN", sizeof(g_state));
+        BT_Send("$TURN,RESUME_LINE\r\n");
+    }
+    /* Neu chua xong: tiep tuc quay (khong lam gi them, dong co dang chay) */
 }
 
 /* =========================================================================
@@ -417,6 +628,8 @@ void Tuning_ResetDefaults(void)
     g_adc_threshold  = DEFAULT_ADC_THRESHOLD;
     g_ramp_step      = DEFAULT_RAMP_STEP;
     g_ramp_min       = DEFAULT_RAMP_MIN_START;
+    g_kp_enc         = DEFAULT_KP_ENC;
+    g_turn_90_counts = DEFAULT_TURN_90_COUNTS;
     g_weight[0]      = DEFAULT_W0;
     g_weight[1]      = DEFAULT_W1;
     g_weight[2]      = DEFAULT_W2;
@@ -426,6 +639,7 @@ void Tuning_ResetDefaults(void)
     g_last_error     = 0.0f;
     g_ramp_speed     = 0;
     g_ramping        = 0;
+    g_turn_state     = TURN_IDLE;
 
     printf("[TUNE] Reset ve mac dinh\r\n");
     BT_Send("$TUNE,RESET_OK\r\n");
@@ -434,7 +648,7 @@ void Tuning_ResetDefaults(void)
 
 void BT_SendTuningMenu(void)
 {
-    char buf[180];
+    char buf[200];
 
     BT_Send("$TUNE_MENU_START\r\n");
     BT_Send("$TUNE,---- DUNG XE - TUNING PID ----\r\n");
@@ -460,6 +674,11 @@ void BT_SendTuningMenu(void)
     BT_Send(buf);
 
     snprintf(buf, sizeof(buf),
+             "$TUNE,KP_ENC=%.3f  TURN_90=%u\r\n",
+             g_kp_enc, g_turn_90_counts);
+    BT_Send(buf);
+
+    snprintf(buf, sizeof(buf),
              "$TUNE,ADC_THR=%u  raw=[%u,%u,%u,%u,%u]\r\n",
              g_adc_threshold,
              g_adc_raw[0], g_adc_raw[1], g_adc_raw[2],
@@ -476,15 +695,17 @@ void BT_SendTuningMenu(void)
     BT_Send("$TUNE_CMD: P=Kp I=Ki D=Kd\r\n");
     BT_Send("$TUNE_CMD: B=BaseSpd O=LostSpd\r\n");
     BT_Send("$TUNE_CMD: Z=RampStep N=RampMin\r\n");
+    BT_Send("$TUNE_CMD: E=KpEnc C=Turn90Counts\r\n");
     BT_Send("$TUNE_CMD: V=ManSpd X=Timeout H=ADCthresh\r\n");
     BT_Send("$TUNE_CMD: W1..W5=TrongSo(L2..R2)\r\n");
     BT_Send("$TUNE_CMD: R=Reset  Q=Thoat+TiepTuc\r\n");
-    BT_Send("$TUNE_EX:  P2.5 D1.2 Z3 N10 W18.0 W4-1.5\r\n");
+    BT_Send("$TUNE_EX:  P2.5 D1.2 E0.3 C120 W18.0\r\n");
     BT_Send("$TUNE_MENU_END\r\n");
 
-    printf("[TUNE] Kp=%.2f Ki=%.3f Kd=%.2f BASE=%d LOST=%d RAMP=%d/%d THR=%u\r\n",
-           g_kp, g_ki, g_kd, g_base_speed, g_turn_lost,
-           g_ramp_step, g_ramp_min, g_adc_threshold);
+    printf("[TUNE] Kp=%.2f Ki=%.3f Kd=%.2f BASE=%d LOST=%d\r\n",
+           g_kp, g_ki, g_kd, g_base_speed, g_turn_lost);
+    printf("[TUNE] RAMP=%d/%d KP_ENC=%.3f TURN90=%u THR=%u\r\n",
+           g_ramp_step, g_ramp_min, g_kp_enc, g_turn_90_counts, g_adc_threshold);
     printf("[TUNE] W=[%.2f,%.2f,%.2f,%.2f,%.2f]\r\n",
            g_weight[0], g_weight[1], g_weight[2],
            g_weight[3], g_weight[4]);
@@ -502,6 +723,7 @@ void EnterTuningMode(void)
     g_manual_active = 0;
     g_ramping       = 0;
     g_ramp_speed    = 0;
+    g_turn_state    = TURN_IDLE;
     Motors_Brake();
     strncpy(g_state, "TUNING         ", sizeof(g_state));
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
@@ -522,7 +744,7 @@ void ExitTuningMode(void)
 
     if (g_resume_run && g_mode == MODE_AUTO) {
         g_running = 1;
-        Ramp_Reset();   /* Tang toc tu tu sau khi thoat tuning */
+        Ramp_Reset();
         HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
         strncpy(g_state, "PID_RUN        ", sizeof(g_state));
         printf("\r\n=== TUNING EXIT: Tiep tuc chay AUTO (soft start) ===\r\n");
@@ -560,7 +782,7 @@ void BT_ProcessCommand(const char *cmd)
         if (c == 'Q' || c == 'q') { ExitTuningMode(); return; }
         if (c == 'R' || c == 'r') { Tuning_ResetDefaults(); return; }
 
-        /* Lenh W: chinh trong so sensor W1..W5 */
+        /* Lenh W: chinh trong so sensor */
         if (c == 'W' || c == 'w') {
             if (cmd[1] >= '1' && cmd[1] <= '5') {
                 uint8_t idx  = (uint8_t)(cmd[1] - '1');
@@ -571,7 +793,7 @@ void BT_ProcessCommand(const char *cmd)
                 BT_Send(ack);
                 BT_SendTuningMenu();
             } else {
-                BT_Send("$ERR,W phai co index 1-5. Vi du: W18.0 W4-1.5\r\n");
+                BT_Send("$ERR,W phai co index 1-5. Vi du: W18.0\r\n");
             }
             return;
         }
@@ -620,7 +842,6 @@ void BT_ProcessCommand(const char *cmd)
                     BT_Send(ack); BT_SendTuningMenu(); break;
 
                 case 'Z': case 'z':
-                    /* Ramp step: muc tang toc do moi chu ky 10ms (1..10) */
                     if (val < 1)  val = 1;
                     if (val > 10) val = 10;
                     g_ramp_step = (uint8_t)val;
@@ -628,18 +849,33 @@ void BT_ProcessCommand(const char *cmd)
                 BT_Send(ack); BT_SendTuningMenu(); break;
 
                 case 'N': case 'n':
-                    /* Ramp min start: toc do khoi dong (5..50) */
                     if (val < 5)  val = 5;
                     if (val > 50) val = 50;
                     g_ramp_min = (uint8_t)val;
                 snprintf(ack, sizeof(ack), "$TUNE,RAMP_MIN=%d OK\r\n", g_ramp_min);
                 BT_Send(ack); BT_SendTuningMenu(); break;
 
+                /* ---- MỚI: chinh he so encoder correction ---- */
+                case 'E': case 'e':
+                    if (fval < 0.0f) fval = 0.0f;
+                    if (fval > 5.0f) fval = 5.0f;
+                    g_kp_enc = fval;
+                snprintf(ack, sizeof(ack), "$TUNE,KP_ENC=%.3f OK\r\n", g_kp_enc);
+                BT_Send(ack); BT_SendTuningMenu(); break;
+
+                /* ---- MỚI: chinh so xung quay 90 do ---- */
+                case 'C': case 'c':
+                    if (val < 10)   val = 10;
+                    if (val > 5000) val = 5000;
+                    g_turn_90_counts = (uint16_t)val;
+                snprintf(ack, sizeof(ack), "$TUNE,TURN90=%u OK\r\n", g_turn_90_counts);
+                BT_Send(ack); BT_SendTuningMenu(); break;
+
                 default:
                     BT_Send("$ERR,Unknown tune cmd. Q=exit.\r\n"); break;
             }
         } else {
-            BT_Send("$ERR,TUNING: them gia tri. Vi du P12.0 D3.5 Z3 N10\r\n");
+            BT_Send("$ERR,TUNING: them gia tri. Vi du P12.0 D3.5 E0.3 C120\r\n");
         }
         return;
     }
@@ -653,13 +889,13 @@ void BT_ProcessCommand(const char *cmd)
             g_running    = 1;
             g_integral   = 0.0f;
             g_last_error = 0.0f;
-            Ramp_Reset();   /* Bat dau tang toc tu tu */
+            Ramp_Reset();
             HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
             strncpy(g_state, "PID_RUN        ", sizeof(g_state));
             printf("\r\n=== BT: GO (soft start) ===\r\n");
             BT_Send("$CMD,GO\r\n");
         } else {
-            BT_Send("$ERR,Go chi dung trong . Gui A truoc.\r\n");
+            BT_Send("$ERR,Go chi dung trong AUTO. Gui A truoc.\r\n");
         }
         return;
     }
@@ -669,12 +905,28 @@ void BT_ProcessCommand(const char *cmd)
         g_manual_active = 0;
         g_ramping       = 0;
         g_ramp_speed    = 0;
+        g_turn_state    = TURN_IDLE;
         Motors_Brake();
         HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
         strncpy(g_state, "STOP           ", sizeof(g_state));
         printf("\r\n=== BT: STOP ===\r\n");
         BT_Send("$CMD,STOP\r\n");
         return;
+    }
+
+    /*
+     * Lenh J/L trong AUTO mode dang chay: kich hoat quay 90 do
+     * Lenh J/L trong MANUAL mode: dieu khien tay nhu cu
+     */
+    if (g_mode == MODE_AUTO && g_running && !g_tuning) {
+        if ((c == 'J' || c == 'j') && g_turn_state == TURN_IDLE) {
+            Turn90_Start(TURN_LEFT);
+            return;
+        }
+        if ((c == 'L' || c == 'l') && g_turn_state == TURN_IDLE) {
+            Turn90_Start(TURN_RIGHT);
+            return;
+        }
     }
 
     if (g_mode == MODE_MANUAL) {
@@ -693,6 +945,7 @@ void SetMode(DriveMode_t mode)
     g_manual_active = 0;
     g_ramping       = 0;
     g_ramp_speed    = 0;
+    g_turn_state    = TURN_IDLE;
     Motors_Brake();
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
     strncpy(g_state, "STOP           ", sizeof(g_state));
@@ -706,9 +959,6 @@ void SetMode(DriveMode_t mode)
 
 /* =========================================================================
  * ManualDrive - I=Tien K=Lui J=Trai L=Phai
- *
- * Soft start ap dung cho tien/lui (I/K).
- * Quay tai cho (J/L): khong ramp vi toc do thap va can phan hoi ngay.
  * =========================================================================*/
 void ManualDrive(uint8_t cmd)
 {
@@ -732,7 +982,6 @@ void ManualDrive(uint8_t cmd)
             break;
 
         case 'J': case 'j':
-            /* Quay tai cho: full speed ngay, khong ramp */
             strncpy(g_state, "MAN-LEFT       ", sizeof(g_state));
             g_ramping = 0;
             MotorA_SetSpeed(-g_manual_speed);
@@ -742,7 +991,6 @@ void ManualDrive(uint8_t cmd)
             break;
 
         case 'L': case 'l':
-            /* Quay tai cho: full speed ngay, khong ramp */
             strncpy(g_state, "MAN-RIGHT      ", sizeof(g_state));
             g_ramping = 0;
             MotorA_SetSpeed( g_manual_speed);
@@ -774,7 +1022,7 @@ void ManualTimeoutCheck(void)
 }
 
 /* =========================================================================
- * UART RX Interrupt - nhan lenh BT
+ * UART RX Interrupt
  * =========================================================================*/
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
@@ -831,14 +1079,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 /* =========================================================================
  * LineFollow_PID
  *
- * Soft start tich hop:
- *   - Moi lan bat dau (G, nut, ExitTuning) -> Ramp_Reset() -> g_ramp_speed = g_ramp_min
- *   - Moi chu ky 10ms: tang g_ramp_speed them g_ramp_step
- *   - effective_base = g_ramp_speed (thay the g_base_speed truc tiep)
- *   - Khi g_ramp_speed dat g_base_speed: g_ramping = 0, chay binh thuong
- *
- * Thoi gian tang toc ~= (g_base_speed - g_ramp_min) / g_ramp_step * 10ms
- * Vi du mac dinh: (45 - 15) / 2 * 10ms = 150ms
+ * Tich hop Encoder Straight Correction:
+ *   - Chi hoat dong khi |g_error| < ENC_STRAIGHT_ERROR_THRESHOLD
+ *     (xe dang di gan thang, khong vao cua)
+ *   - Tinh delta xung 2 banh trong chu ky 10ms
+ *   - delta duong = banh trai nhanh hon -> giam trai, tang phai
+ *   - delta am   = banh phai nhanh hon -> tang trai, giam phai
+ *   - Correction duoc cong vao output PID truoc khi ap dung
  * =========================================================================*/
 void LineFollow_PID(void)
 {
@@ -872,7 +1119,6 @@ void LineFollow_PID(void)
     if (count == 0)
     {
         strncpy(g_state, "LOST_LINE      ", sizeof(g_state));
-        /* Khi mat line van giu toc do theo ramp hien tai (khong vuot qua g_turn_lost) */
         int lost_spd = (effective_base < (int)g_turn_lost) ? effective_base : (int)g_turn_lost;
         if (g_last_error < -1.5f) {
             MotorA_SetSpeed(-lost_spd);
@@ -884,6 +1130,9 @@ void LineFollow_PID(void)
             MotorA_SetSpeed(lost_spd);
             MotorB_SetSpeed(lost_spd);
         }
+        /* Reset enc prev khi mat line de tranh correction sai khi gap lai */
+        g_enc_left_prev  = Enc_ReadLeft();
+        g_enc_right_prev = Enc_ReadRight();
         return;
     }
     else if (count >= 4)
@@ -918,14 +1167,47 @@ void LineFollow_PID(void)
     float output = P + I + D;
     g_last_error = g_error;
 
-    /* ---- Adaptive Speed (dua tren effective_base) ---- */
-    int adaptive_base = effective_base - (int)(fabs(output) * 1.5f);
-    /* San toc do toi thieu: thap hon khi con ramp, cao hon khi da on dinh */
+    /* ====================================================================
+     * ENCODER STRAIGHT CORRECTION
+     *
+     * Tinh delta xung 2 banh trong chu ky nay (10ms).
+     * delta > 0 : banh trai nhanh hon -> can giam trai / tang phai
+     * delta < 0 : banh phai nhanh hon -> can tang trai / giam phai
+     *
+     * Chi ap dung khi xe di thang (|error| < nguong):
+     *   - Tranh xung dot voi PID khi dang vao cua (error lon)
+     *   - Khi vao cua, PID da xu ly chenh lech, khong can correction
+     *
+     * enc_correction duoc tru khoi output (cung huong voi PID convention):
+     *   output duong -> quay phai (Motor A nhanh hon B)
+     *   enc_correction duong (trai nhanh) -> phai tru them -> thang lai
+     * ====================================================================*/
+    int32_t enc_now_L  = Enc_ReadLeft();
+    int32_t enc_now_R  = Enc_ReadRight();
+    int32_t delta_L    = enc_now_L - g_enc_left_prev;
+    int32_t delta_R    = enc_now_R - g_enc_right_prev;
+    g_enc_left_prev    = enc_now_L;
+    g_enc_right_prev   = enc_now_R;
+
+    float enc_correction = 0.0f;
+    if (fabsf(g_error) < ENC_STRAIGHT_ERROR_THRESHOLD) {
+        /* Banh phai phan xa thi delta duong = trai nhanh hon */
+        enc_correction = g_kp_enc * (float)(delta_L - delta_R);
+    }
+
+    float final_output = output + enc_correction;
+
+    /* ---- Adaptive Speed ---- */
+    int adaptive_base = effective_base - (int)(fabsf(final_output) * 1.5f);
     int spd_floor = g_ramping ? (int)g_ramp_min : 15;
     if (adaptive_base < spd_floor) adaptive_base = spd_floor;
 
-    MotorA_SetSpeed(adaptive_base + (int)output);
-    MotorB_SetSpeed(adaptive_base - (int)output);
+    MotorA_SetSpeed(adaptive_base + (int)final_output);
+    MotorB_SetSpeed(adaptive_base - (int)final_output);
+
+    /* Luu gia tri encoder tong the de in log */
+    g_enc_left  = enc_now_L;
+    g_enc_right = enc_now_R;
 }
 
 /* =========================================================================
@@ -933,23 +1215,18 @@ void LineFollow_PID(void)
  * =========================================================================*/
 void UART_PrintStatus(void)
 {
-    g_enc_left  = (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(&htim2);
-    g_enc_right = (int32_t)(int16_t)__HAL_TIM_GET_COUNTER(&htim4);
-
-    printf("[%s][%s][%s][%s] L2=%d(%d) L1=%d(%d) C=%d(%d) R1=%d(%d) R2=%d(%d)"
-    " | %-15s | Err:%5.2f | A:%+4d B:%+4d | Rmp:%d(%d) | EL:%6ld ER:%6ld\r\n",
-           g_mode == MODE_AUTO ? "AUTO  " : "MANUAL",
-           g_running ? "RUN" : "STP",
-           g_tuning  ? "TUNE" : "    ",
-           g_ramping ? "RMP" : "   ",
-           g_L2, g_adc_raw[0],
-           g_L1, g_adc_raw[1],
-           g_C,  g_adc_raw[2],
-           g_R1, g_adc_raw[3],
-           g_R2, g_adc_raw[4],
-           g_state, g_error,
-           (int)g_spd_A, (int)g_spd_B,
-           (int)g_ramp_speed, (int)g_ramping,
+    printf("[%s][%s][%s][%s][T:%s] L2=%d L1=%d C=%d R1=%d R2=%d"
+    " | %-15s | Err:%5.2f | A:%+4d B:%+4d | Rmp:%d | EL:%6ld ER:%6ld\r\n",
+    g_mode == MODE_AUTO ? "AUTO  " : "MANUAL",
+    g_running ? "RUN" : "STP",
+    g_tuning  ? "TUNE" : "    ",
+    g_ramping ? "RMP" : "   ",
+    g_turn_state == TURN_IDLE  ? "IDLE " :
+    g_turn_state == TURN_LEFT  ? "L90  " : "R90  ",
+    g_L2, g_L1, g_C, g_R1, g_R2,
+    g_state, g_error,
+    (int)g_spd_A, (int)g_spd_B,
+           (int)g_ramp_speed,
            (long)g_enc_left, (long)g_enc_right);
 }
 
@@ -957,15 +1234,16 @@ void BT_SendStatus(void)
 {
     if (g_tuning) return;
 
-    char buf[140];
+    char buf[160];
     snprintf(buf, sizeof(buf),
-             "$%s,%s,%d,%d,%d,%d,%d,%s,%.2f,%+d,%+d,%d,%ld,%ld\r\n",
+             "$%s,%s,%d,%d,%d,%d,%d,%s,%.2f,%+d,%+d,%d,%d,%ld,%ld\r\n",
              g_mode == MODE_AUTO ? "AUTO" : "MAN",
              g_running ? "RUN" : "STP",
              g_L2, g_L1, g_C, g_R1, g_R2,
              g_state, g_error,
              (int)g_spd_A, (int)g_spd_B,
              (int)g_ramp_speed,
+             (int)g_turn_state,
              (long)g_enc_left, (long)g_enc_right);
     BT_Send(buf);
 }
@@ -980,8 +1258,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     if (GPIO_Pin != GPIO_PIN_13) return;
     if (g_mode != MODE_AUTO) return;
     if (g_tuning) return;
+    if (g_turn_state != TURN_IDLE) return;   /* Khong toggle khi dang quay */
 
-    uint32_t now = HAL_GetTick();
+        uint32_t now = HAL_GetTick();
     if ((now - g_btn_last_tick) < DEBOUNCE_MS) return;
     g_btn_last_tick = now;
 
@@ -989,9 +1268,11 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
     if (g_running) {
         HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
-        g_integral   = 0.0f;
-        g_last_error = 0.0f;
-        Ramp_Reset();   /* Bat dau tang toc tu tu */
+        g_integral      = 0.0f;
+        g_last_error    = 0.0f;
+        g_enc_left_prev  = Enc_ReadLeft();
+        g_enc_right_prev = Enc_ReadRight();
+        Ramp_Reset();
         printf("\r\n=== AUTO: BAT DAU CHAY (soft start) ===\r\n");
         BT_Send("$CMD,START\r\n");
     } else {
@@ -1046,13 +1327,21 @@ int main(void)
     SetMode(MODE_AUTO);
     HAL_UART_Receive_IT(&huart1, &g_bt_rx_byte, 1);
 
+    /* Khoi tao enc_prev sau khi encoder da start */
+    g_enc_left_prev  = Enc_ReadLeft();
+    g_enc_right_prev = Enc_ReadRight();
+
     printf("\r\n========================================\r\n");
     printf("  Line Follower PID  STM32F411RE\r\n");
     printf("  ADC DMA TCRT5000 x5 + Encoder\r\n");
     printf("  Soft Start: min=%d step=%d\r\n", g_ramp_min, g_ramp_step);
+    printf("  Enc Correction: kp=%.3f thr=%.1f\r\n",
+           g_kp_enc, ENC_STRAIGHT_ERROR_THRESHOLD);
+    printf("  Turn 90: counts=%d speed=%d timeout=%dms\r\n",
+           g_turn_90_counts, TURN_SPEED, TURN_TIMEOUT_MS);
     printf("========================================\r\n\r\n");
 
-    BT_Send("$BOOT,LineFollower_PID_STM32_DMA_SoftStart\r\n");
+    BT_Send("$BOOT,LineFollower_PID_STM32_ENC_TURN90\r\n");
     BT_SendTuningMenu();
 
     uint32_t last_print = 0;
@@ -1062,18 +1351,30 @@ int main(void)
     {
         uint32_t now = HAL_GetTick();
 
-        /* Chu ky PID ~10ms (100Hz) */
+        /* Chu ky chinh ~10ms (100Hz) */
         if (now - loop_tick >= 10)
         {
             loop_tick = now;
 
-            if (g_mode == MODE_AUTO && g_running && !g_tuning) {
-                LineFollow_PID();
+            if (g_mode == MODE_AUTO && !g_tuning)
+            {
+                if (g_turn_state != TURN_IDLE)
+                {
+                    /*
+                     * Dang quay 90 do: xu ly quay, KHONG chay PID line.
+                     * Turn90_Update() tu ket thuc va reset sang PID khi xong.
+                     */
+                    Turn90_Update();
+                }
+                else if (g_running)
+                {
+                    /* Di thang: bam line voi PID + encoder correction */
+                    LineFollow_PID();
+                }
             }
 
             if (g_mode == MODE_MANUAL && !g_tuning) {
                 ManualTimeoutCheck();
-                /* Cap nhat ramp cho manual (tien/lui) */
                 if (g_manual_active && g_ramping) {
                     Ramp_Update_Manual();
                 }
@@ -1089,7 +1390,7 @@ int main(void)
 }
 
 /* =========================================================================
- * Peripheral Init
+ * Peripheral Init - giu nguyen tu code goc
  * =========================================================================*/
 void SystemClock_Config(void)
 {
@@ -1119,9 +1420,6 @@ void SystemClock_Config(void)
     if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) Error_Handler();
 }
 
-/* -------------------------------------------------------------------------
- * TIM2 - Encoder Trai (PA0=CH1, PA1=CH2)
- * -------------------------------------------------------------------------*/
 static void MX_TIM2_Init(void)
 {
     TIM_Encoder_InitTypeDef sConfig       = {0};
@@ -1161,9 +1459,6 @@ static void MX_TIM2_Init(void)
     HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig);
 }
 
-/* -------------------------------------------------------------------------
- * TIM3 - PWM Motor (PA7=CH2, PB0=CH3)
- * -------------------------------------------------------------------------*/
 static void MX_TIM3_Init(void)
 {
     TIM_MasterConfigTypeDef sMasterConfig = {0};
@@ -1193,9 +1488,6 @@ static void MX_TIM3_Init(void)
     HAL_TIM_MspPostInit(&htim3);
 }
 
-/* -------------------------------------------------------------------------
- * TIM4 - Encoder Phai (PB6=CH1, PB7=CH2)
- * -------------------------------------------------------------------------*/
 static void MX_TIM4_Init(void)
 {
     TIM_Encoder_InitTypeDef sConfig       = {0};
@@ -1235,11 +1527,6 @@ static void MX_TIM4_Init(void)
     HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig);
 }
 
-/* -------------------------------------------------------------------------
- * MX_ADC1_Init
- *   Scan 5 kenh lien tuc qua DMA circular
- *   Scan order: CH9(L2) CH14(L1) CH15(C) CH6(R1) CH13(R2)
- * -------------------------------------------------------------------------*/
 static void MX_ADC1_Init(void)
 {
     GPIO_InitTypeDef       GPIO_InitStruct = {0};
@@ -1295,20 +1582,16 @@ static void MX_ADC1_Init(void)
     sConfig.SamplingTime = ADC_SAMPLETIME_56CYCLES;
     if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
 
-    sConfig.Channel = ADC_CHANNEL_14;
-    sConfig.Rank    = 2;
+    sConfig.Channel = ADC_CHANNEL_14; sConfig.Rank = 2;
     if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
 
-    sConfig.Channel = ADC_CHANNEL_15;
-    sConfig.Rank    = 3;
+    sConfig.Channel = ADC_CHANNEL_15; sConfig.Rank = 3;
     if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
 
-    sConfig.Channel = ADC_CHANNEL_6;
-    sConfig.Rank    = 4;
+    sConfig.Channel = ADC_CHANNEL_6;  sConfig.Rank = 4;
     if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
 
-    sConfig.Channel = ADC_CHANNEL_13;
-    sConfig.Rank    = 5;
+    sConfig.Channel = ADC_CHANNEL_13; sConfig.Rank = 5;
     if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
 }
 
@@ -1317,9 +1600,6 @@ void DMA2_Stream0_IRQHandler(void)
     HAL_DMA_IRQHandler(&hdma_adc1);
 }
 
-/* -------------------------------------------------------------------------
- * USART1 - HC-05 (PA9=TX, PA10=RX) @ 38400
- * -------------------------------------------------------------------------*/
 static void MX_USART1_UART_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -1345,9 +1625,6 @@ static void MX_USART1_UART_Init(void)
     if (HAL_UART_Init(&huart1) != HAL_OK) Error_Handler();
 }
 
-/* -------------------------------------------------------------------------
- * USART2 - Debug ST-Link (PA2=TX, PA3=RX) @ 115200
- * -------------------------------------------------------------------------*/
 static void MX_USART2_UART_Init(void)
 {
     huart2.Instance          = USART2;
@@ -1361,9 +1638,6 @@ static void MX_USART2_UART_Init(void)
     if (HAL_UART_Init(&huart2) != HAL_OK) Error_Handler();
 }
 
-/* -------------------------------------------------------------------------
- * GPIO Init
- * -------------------------------------------------------------------------*/
 static void MX_GPIO_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -1399,9 +1673,6 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 }
 
-/* =========================================================================
- * Error Handler
- * =========================================================================*/
 void Error_Handler(void)
 {
     __disable_irq();
